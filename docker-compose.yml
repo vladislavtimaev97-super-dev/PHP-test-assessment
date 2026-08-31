@@ -1,0 +1,89 @@
+x-app-env: &app-env
+  DB_DSN: "pgsql:host=db;port=5432;dbname=gamestore"
+  DB_USER: gamestore
+  DB_PASSWORD: gamestore
+  API_URL: http://api:8080
+  SUPPLIER_A_URL: http://supplier-a:8080
+  SUPPLIER_B_URL: http://supplier-b:8080
+  SUPPLIER_ORDER: "A,B"
+  SUPPLIER_TIMEOUT: "2"
+  SUPPLIER_MAX_ATTEMPTS: "3"
+  SUPPLIER_BACKOFF_BASE_MS: "200"
+  SUPPLIER_BACKOFF_JITTER_MS: "150"
+  STUCK_ORDER_SECONDS: "10"
+  WORKER_SWEEP_SECONDS: "5"
+  WORKER_STOCK_SYNC_SECONDS: "15"
+  SEED_EXTRA_SKUS: "5000"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: gamestore
+      POSTGRES_USER: gamestore
+      POSTGRES_PASSWORD: gamestore
+    # 16 api workers + worker + test harness all hold their own connection
+    command: ["postgres", "-c", "max_connections=300"]
+    ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gamestore -d gamestore"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    build: .
+    environment: *app-env
+    depends_on:
+      db: { condition: service_healthy }
+    command: ["sh", "-c", "php bin/migrate.php && php bin/seed.php"]
+    restart: "no"
+
+  api:
+    build: .
+    environment: *app-env
+    depends_on:
+      db: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    ports: ["8080:8080"]
+    command: ["php", "-S", "0.0.0.0:8080", "-t", "public", "public/router.php"]
+
+  worker:
+    build: .
+    environment: *app-env
+    depends_on:
+      db: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    command: ["php", "bin/worker.php"]
+
+  supplier-a:
+    build: .
+    environment:
+      <<: *app-env
+      SUPPLIER_NAME: A
+    depends_on:
+      db: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    ports: ["8081:8080"]
+    command: ["php", "-S", "0.0.0.0:8080", "-t", "public-supplier", "public-supplier/router.php"]
+
+  supplier-b:
+    build: .
+    environment:
+      <<: *app-env
+      SUPPLIER_NAME: B
+    depends_on:
+      db: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    ports: ["8082:8080"]
+    command: ["php", "-S", "0.0.0.0:8080", "-t", "public-supplier", "public-supplier/router.php"]
+
+  # One-shot container for tests / scenarios / explain, on the same network.
+  tools:
+    build: .
+    environment: *app-env
+    depends_on:
+      db: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    profiles: ["tools"]
+    command: ["php", "-v"]
