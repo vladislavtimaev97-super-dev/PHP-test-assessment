@@ -130,9 +130,19 @@ Cli::info('statuses: ' . json_encode(array_combine(
 $check($delivered === count($ids), 'every paid order was delivered');
 $check(
     (int) Db::value(
-        "SELECT count(*) FROM (SELECT order_id FROM deliveries GROUP BY order_id HAVING count(*) > 1) x"
+        // Scoped to this run's own single-item orders: elsewhere in a
+        // shared dev database a basket order legitimately holds several
+        // deliveries (one per item), so "one delivery per order" is no
+        // longer a system-wide invariant — "one delivery per ITEM" is
+        // (checked globally below via UNIQUE(item_id) never being violated).
+        "SELECT count(*) FROM (
+             SELECT order_id FROM deliveries
+             WHERE order_id = ANY(string_to_array(:ids, ','))
+             GROUP BY order_id HAVING count(*) > 1
+         ) x",
+        ['ids' => implode(',', $ids)]
     ) === 0,
-    'no order has more than one delivery'
+    'no (single-item) order in this run has more than one delivery'
 );
 $check(
     (int) Db::value('SELECT count(*) FROM (SELECT code FROM deliveries GROUP BY code HAVING count(*) > 1) x') === 0,

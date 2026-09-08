@@ -3,12 +3,14 @@
 declare(strict_types=1);
 
 /**
- * The six acceptance scenarios from the task, end to end, against the running
- * stack. Assertions are made against the DATABASE, not against API responses,
- * so a scenario cannot pass by being told a comfortable story.
+ * The stage-1 acceptance scenarios (1-6) plus the stage-2 ones (7-10), end to
+ * end, against the running stack. Assertions are made against the DATABASE,
+ * not against API responses, so a scenario cannot pass by being told a
+ * comfortable story.
  *
  *   php bin/scenarios.php              # all of them
  *   php bin/scenarios.php --only=1,4   # a subset
+ *   php bin/scenarios.php --only=7,8,9,10   # just the stage-2 ones
  */
 
 use App\Infra\Db;
@@ -19,7 +21,7 @@ use App\Support\WebhookSender;
 require __DIR__ . '/../vendor/autoload.php';
 
 $args = Cli::args($argv);
-$only = isset($args['only']) ? array_map('intval', explode(',', $args['only'])) : [1, 2, 3, 4, 5, 6];
+$only = isset($args['only']) ? array_map('intval', explode(',', $args['only'])) : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
 $api      = ApiClient::api();
 $supplier = ['A' => ApiClient::supplier('A'), 'B' => ApiClient::supplier('B')];
@@ -53,8 +55,41 @@ $healthy = function () use ($supplier): void {
             'down' => false, 'out_of_stock' => false, 'fail_rate' => 0,
             'timeout_rate' => 0, 'latency_ms' => 0, 'hang_ms' => 5000,
             'hang_only_first' => true, 'issue_before_hang' => true,
+            'duplicate_code_rate' => 0, 'lie_about_error_rate' => 0, 'rate_limit_per_min' => 0,
         ]);
     }
+    Db::run('DELETE FROM supplier_rate_limits');
+};
+
+$newBasket = function (array $skus, ?string $orderId = null) use ($api): array {
+    $body = ['items' => array_map(static fn (string $sku): array => ['sku' => $sku], $skus)];
+    if ($orderId !== null) {
+        $body['order_id'] = $orderId;
+    }
+    $order = $api->post('/orders', $body);
+    if (!isset($order['id'])) {
+        throw new RuntimeException('basket order creation failed: ' . json_encode($order));
+    }
+
+    return $order;
+};
+
+$itemStatus = fn (string $itemId): string => (string) (Db::value(
+    'SELECT status FROM order_items WHERE id = :i',
+    ['i' => $itemId]
+) ?? 'missing');
+
+$waitForItemStatus = function (string $itemId, array $wanted, float $seconds) use ($itemStatus): string {
+    $deadline = microtime(true) + $seconds;
+    do {
+        $s = $itemStatus($itemId);
+        if (in_array($s, $wanted, true)) {
+            return $s;
+        }
+        usleep(200_000);
+    } while (microtime(true) < $deadline);
+
+    return $itemStatus($itemId);
 };
 
 $newOrder = function (string $sku, ?string $orderId = null) use ($api): array {
@@ -77,6 +112,11 @@ $issued = fn (string $s): int => (int) Db::value(
 
 $countDeliveries = fn (string $orderId): int => (int) Db::value(
     'SELECT count(*) FROM deliveries WHERE order_id = :o',
+    ['o' => $orderId]
+);
+
+$findDelivery = fn (string $orderId): ?array => Db::one(
+    'SELECT * FROM deliveries WHERE order_id = :o ORDER BY id LIMIT 1',
     ['o' => $orderId]
 );
 
@@ -366,6 +406,254 @@ if (in_array(6, $only, true)) {
 }
 
 // ---------------------------------------------------------------------
+// 7. basket with partial fulfillment: some items delivered, one refunded
+// ---------------------------------------------------------------------
+if (in_array(7, $only, true)) {
+    Cli::head('7) basket order: one item cannot be fulfilled, the rest stay delivered');
+    $healthy();
+
+    $order   = $newBasket(['KEY-CS2-PRIME', 'KEY-GTA5', 'KEY-EFT']);
+    $orderId = (string) $order['id'];
+
+    // Deterministically leave exactly 2 free keys system-wide (both
+    // suppliers), so the first two items in the basket can be delivered and
+    // the third genuinely finds every supplier empty. This is scenario
+    // tooling reaching into the stub's own storage to set up a precise
+    // condition — the core under test never does this itself.
+    Db::run(
+        "UPDATE stub.keys SET status = 'issued', request_id = 'scenario7_drain', issued_at = now()
+         WHERE status = 'free' AND id NOT IN (
+             SELECT id FROM stub.keys WHERE status = 'free' ORDER BY id LIMIT 2
+         )"
+    );
+
+    $hooks->sendConcurrently(WebhookSender::payloads($orderId, (float) $order['amount'], 1, 'same'));
+
+    $final = $waitForStatus($orderId, ['partially_delivered'], 60);
+    $check($final === 'partially_delivered', "order settled as partially_delivered (got {$final})");
+
+    $check(
+        (int) Db::value("SELECT count(*) FROM order_items WHERE order_id = :o AND status = 'delivered'", ['o' => $orderId]) === 2,
+        '2 of 3 items were delivered'
+    );
+    $check(
+        (int) Db::value("SELECT count(*) FROM order_items WHERE order_id = :o AND status = 'refunded'", ['o' => $orderId]) === 1,
+        'exactly 1 item was refunded after giving up'
+    );
+    $check((int) Db::value('SELECT count(*) FROM deliveries WHERE order_id = :o', ['o' => $orderId]) === 2, 'exactly 2 delivery rows (never 3)');
+    $check(
+        (int) Db::value("SELECT count(*) FROM ledger_entries WHERE order_id = :o AND entry_type = 'delivery_recognized'", ['o' => $orderId]) === 4,
+        'two delivery_recognized events, two legs each'
+    );
+    $check(
+        (int) Db::value("SELECT count(*) FROM ledger_entries WHERE order_id = :o AND entry_type = 'item_refunded'", ['o' => $orderId]) === 2,
+        'exactly one item_refunded event, two legs'
+    );
+    $check(
+        (int) Db::value('SELECT COALESCE(sum(amount_minor),0) FROM ledger_entries WHERE order_id = :o', ['o' => $orderId]) === 0,
+        'paid = delivered + refunded: the order balances to zero in the journal'
+    );
+
+    // Repeating the delivery attempt (crash-and-restart simulation) must not
+    // create a second delivery or a second refund.
+    $api->post('/orders/' . $orderId . '/deliver', ['mode' => 'sync']);
+    $check((int) Db::value('SELECT count(*) FROM deliveries WHERE order_id = :o', ['o' => $orderId]) === 2, 'retry created no extra delivery');
+    $check(
+        (int) Db::value("SELECT count(*) FROM ledger_entries WHERE order_id = :o AND entry_type = 'item_refunded'", ['o' => $orderId]) === 2,
+        'retry created no extra refund'
+    );
+
+    // give the drained keys back to the pool for later scenarios
+    Db::run("UPDATE stub.keys SET status = 'free', request_id = NULL, issued_at = NULL WHERE request_id = 'scenario7_drain'");
+    $healthy();
+}
+
+// ---------------------------------------------------------------------
+// 8. a supplier that cannot be trusted
+// ---------------------------------------------------------------------
+if (in_array(8, $only, true)) {
+    Cli::head('8a) supplier answers with an error, but really did issue the code');
+    $healthy();
+    $supplier['A']->post('/_control', ['lie_about_error_rate' => 1]);
+
+    $order   = $newOrder('STEAM-TOPUP-500');
+    $orderId = (string) $order['id'];
+    $beforeA = $issued('A');
+
+    $hooks->sendConcurrently(WebhookSender::payloads($orderId, (float) $order['amount'], 1, 'same'));
+    $final = $waitForStatus($orderId, ['delivered'], 40);
+
+    $check($final === 'delivered', "the order was delivered despite the injected lie (got {$final})");
+    $check($countDeliveries($orderId) === 1, 'exactly one delivery row');
+    $check($issued('A') - $beforeA === 1, 'exactly one key left the pool, not two');
+    $check(
+        (int) Db::value("SELECT count(*) FROM stub.requests WHERE supplier='A' AND order_id = :o AND outcome = 'ok'", ['o' => $orderId]) === 1,
+        "the supplier's own ledger agrees a code was issued"
+    );
+
+    Cli::head('8b) supplier hands out the same code to a second, unrelated request');
+    $supplier['A']->post('/_control', ['lie_about_error_rate' => 0]);
+
+    $orderA   = $newOrder('SUB-DISCORD-1M');
+    $hooks->sendConcurrently(WebhookSender::payloads((string) $orderA['id'], (float) $orderA['amount'], 1, 'same'));
+    $waitForStatus((string) $orderA['id'], ['delivered'], 40);
+    $stolenCode = $findDelivery((string) $orderA['id'])['code'] ?? null;
+
+    $supplier['A']->post('/_control', ['duplicate_code_rate' => 1]);
+    $orderB   = $newOrder('SUB-DISCORD-1M');
+    $orderIdB = (string) $orderB['id'];
+
+    $hooks->sendConcurrently(WebhookSender::payloads($orderIdB, (float) $orderB['amount'], 1, 'same'));
+    $finalB = $waitForStatus($orderIdB, ['delivered'], 40);
+    $codeB  = $findDelivery($orderIdB)['code'] ?? null;
+
+    $check($finalB === 'delivered', "order B was still delivered, from the OTHER supplier (got {$finalB})");
+    $check($codeB !== null && $codeB !== $stolenCode, 'the buyer never received the stolen/duplicated code');
+    $check(($findDelivery($orderIdB)['supplier'] ?? null) === 'B', 'delivery failed over to B automatically, no manual step');
+    $check(
+        (int) Db::value("SELECT count(*) FROM orphan_codes WHERE order_id = :o", ['o' => $orderIdB]) >= 1,
+        'the collision was detected and recorded, not silently accepted'
+    );
+    $check(
+        (int) Db::value('SELECT count(*) FROM (SELECT code FROM deliveries GROUP BY code HAVING count(*) > 1) x') === 0,
+        'still: no code was ever attached to two different items'
+    );
+
+    $supplier['A']->post('/_control', ['duplicate_code_rate' => 0]);
+    $healthy();
+}
+
+// ---------------------------------------------------------------------
+// 9. supplier rate limit under a burst: throttled, not lost, not exceeded
+// ---------------------------------------------------------------------
+if (in_array(9, $only, true)) {
+    Cli::head('9) burst of orders against a supplier with a per-minute limit');
+    $healthy();
+    Db::run('DELETE FROM supplier_rate_limits');
+    $supplier['B']->post('/_control', ['down' => true]);             // force everything through A
+    $supplier['A']->post('/_control', ['rate_limit_per_min' => 240]); // the supplier's own tripwire
+    $api->post('/admin/supplier-rate-limit', ['supplier' => 'A', 'capacity' => 3, 'refill_per_sec' => 2]);
+
+    $burst  = 20;
+    $orders = [];
+    for ($i = 0; $i < $burst; $i++) {
+        $order = $newOrder(['KEY-CS2-PRIME', 'KEY-GTA5', 'KEY-EFT'][$i % 3]);
+        $orders[] = $order;
+    }
+    $payloads = [];
+    foreach ($orders as $order) {
+        $payloads[] = WebhookSender::payloads((string) $order['id'], (float) $order['amount'], 1, 'same')[0];
+    }
+    $hooks->sendConcurrently($payloads);
+
+    usleep(700_000);
+    $queue = $api->get('/admin/queue');
+    Cli::info(sprintf(
+        'mid-burst progress: queued/running=%s, delivered_last_minute=%d',
+        json_encode($queue['jobs_by_status']),
+        $queue['delivered_last_minute']
+    ));
+    $check(
+        array_sum(array_column(array_filter($queue['jobs_by_status'], fn ($r) => $r['status'] === 'queued'), 'n')) > 0
+            || array_sum(array_column(array_filter($queue['jobs_by_status'], fn ($r) => $r['status'] === 'running'), 'n')) > 0,
+        'the burst is visibly queued/in flight, not silently dropped'
+    );
+
+    $ids      = array_column($orders, 'id');
+    $deadline = microtime(true) + 60;
+    do {
+        $delivered = (int) Db::value(
+            "SELECT count(*) FROM orders WHERE id = ANY(string_to_array(:ids, ',')) AND status = 'delivered'",
+            ['ids' => implode(',', $ids)]
+        );
+        if ($delivered === count($ids)) {
+            break;
+        }
+        usleep(300_000);
+    } while (microtime(true) < $deadline);
+
+    $check($delivered === count($ids), "all {$burst} orders were eventually delivered ({$delivered}/{$burst})");
+    $check(
+        (int) Db::value(
+            "SELECT count(*) FROM delivery_attempts WHERE order_id = ANY(string_to_array(:ids, ',')) AND http_status = 429",
+            ['ids' => implode(',', $ids)]
+        ) === 0,
+        "the supplier's own limit was never exceeded (zero 429s)"
+    );
+
+    // The queue's own ordering guarantee (what claim() relies on): a
+    // customer-priority job sorts before a background one, regardless of
+    // insertion order.
+    Db::run('UPDATE supplier_rate_limits SET tokens = 0 WHERE supplier = :s', ['s' => 'A']);
+    $x = $newOrder('KEY-CS2-PRIME');
+    $y = $newOrder('KEY-GTA5');
+    $hooks->sendConcurrently(WebhookSender::payloads((string) $x['id'], (float) $x['amount'], 1, 'same'));
+    $hooks->sendConcurrently(WebhookSender::payloads((string) $y['id'], (float) $y['amount'], 1, 'same'));
+    Db::run("UPDATE jobs SET priority = 100 WHERE order_id = :o AND status IN ('queued','running')", ['o' => (string) $y['id']]);
+    $jobRows = Db::all(
+        "SELECT order_id, priority FROM jobs
+         WHERE order_id IN (:x, :y) AND status IN ('queued','running')
+         ORDER BY priority, run_after, id",
+        ['x' => (string) $x['id'], 'y' => (string) $y['id']]
+    );
+    $check(
+        count($jobRows) < 2 || ($jobRows[0]['order_id'] === (string) $x['id']),
+        'a fresh, customer-priority job is ordered ahead of a background one'
+    );
+
+    $supplier['B']->post('/_control', ['down' => false]);
+    Db::run('DELETE FROM supplier_rate_limits');
+    $waitForStatus((string) $x['id'], ['delivered'], 30);
+    $waitForStatus((string) $y['id'], ['delivered'], 30);
+    $healthy();
+}
+
+// ---------------------------------------------------------------------
+// 10. point-in-time reconstruction
+// ---------------------------------------------------------------------
+if (in_array(10, $only, true)) {
+    Cli::head('10) reconstruct order + money state at a past instant');
+    $healthy();
+
+    // gmdate() truncates to whole seconds; several transitions happen
+    // within the same wall-clock second, so a "just now" cutoff needs real
+    // sub-second precision to land in the right place relative to them.
+    $now = fn (): string => (new DateTimeImmutable('now', new DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.u\Z');
+
+    $beforeCreate = $now();
+    usleep(50_000);
+    $order   = $newOrder('SUB-SPOTIFY-1M');
+    $orderId = (string) $order['id'];
+    usleep(300_000);
+    $afterCreateBeforePay = $now();
+
+    $hooks->sendConcurrently(WebhookSender::payloads($orderId, (float) $order['amount'], 1, 'same'));
+    $final = $waitForStatus($orderId, ['delivered'], 40);
+    $check($final === 'delivered', "setup: order reached delivered before reconstructing history (got {$final})");
+    $afterDelivery = $now();
+
+    $before = $api->get('/orders/' . $orderId . '/history?at=' . rawurlencode($beforeCreate));
+    $check(($before['existed'] ?? true) === false, 'before creation, the order did not exist yet');
+
+    $mid = $api->get('/orders/' . $orderId . '/history?at=' . rawurlencode($afterCreateBeforePay));
+    $check(($mid['status'] ?? null) === 'created', "right after creation, status was 'created' (got " . ($mid['status'] ?? 'null') . ')');
+    $check(($mid['money'] ?? []) === [], 'no money had moved yet at that instant');
+
+    $after = $api->get('/orders/' . $orderId . '/history?at=' . rawurlencode($afterDelivery));
+    $check(($after['status'] ?? null) === 'delivered', 'after delivery, the reconstructed status is delivered');
+    $check(
+        (int) array_sum(array_column($after['money'] ?? [], 'balance_minor')) === 0,
+        'the reconstructed money snapshot balances to zero'
+    );
+
+    $period = $api->get('/admin/ledger/period?from=' . rawurlencode($beforeCreate) . '&to=' . rawurlencode($afterDelivery));
+    $check($period['balances_to_zero'] === true, 'ledger totals for the period sum to zero');
+    $check(!empty($period['entries']), 'the period actually contains this order\'s entries');
+
+    $healthy();
+}
+
+// ---------------------------------------------------------------------
 // global invariants
 // ---------------------------------------------------------------------
 Cli::head('global invariants');
@@ -375,13 +663,20 @@ $report = $api->get('/admin/reconciliation?grace_seconds=120');
 $check((int) ($report['totals']['ledger_sum_minor'] ?? -1) === 0, 'the whole money journal sums to zero');
 $check(
     ($report['counts']['duplicate_deliveries'] ?? 1) === 0,
-    'no order has more than one delivery'
+    'no item has more than one delivery'
 );
-$check(($report['counts']['reused_codes'] ?? 1) === 0, 'no key was issued to two orders');
+$check(($report['counts']['reused_codes'] ?? 1) === 0, 'no key was issued to two items');
 $check(($report['counts']['ledger_imbalanced_txns'] ?? 1) === 0, 'no unbalanced ledger transaction');
-$check(($report['counts']['orphan_codes'] ?? 1) === 0, 'no orphaned supplier codes');
+$check(($report['counts']['money_mismatched_orders'] ?? 1) === 0, 'every resolved order: paid = delivered + refunded');
+// orphan_codes is an append-only, permanent record of every caught
+// collision — including the ones scenario 8 deliberately provokes to prove
+// they ARE caught. It is therefore not expected to be zero once an
+// untrusted-supplier scenario has ever run against this database (this
+// process or an earlier one against the same stack), so it is not part of
+// `healthy` either — informational only, not a hard invariant here.
+Cli::info(sprintf('orphan_codes on record: %d (informational — see scenario 4 and 8 for scoped checks)', $report['counts']['orphan_codes'] ?? 0));
 $check(($report['counts']['delivered_not_paid'] ?? 1) === 0, 'nothing was delivered without a payment');
-$check(($report['counts']['paid_not_delivered'] ?? 1) === 0, 'nothing paid is left undelivered');
+$check(($report['counts']['paid_not_delivered'] ?? 1) === 0, 'nothing paid is left undelivered past the grace period');
 
 Cli::line();
 Cli::line(sprintf(
