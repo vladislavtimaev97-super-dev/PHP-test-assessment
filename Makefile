@@ -8,7 +8,7 @@ help:
 	@echo "make up          build and start the stack (api, worker, 2 suppliers, postgres)"
 	@echo "make reset       wipe the database and start clean"
 	@echo "make test        unit + integration tests (PHPUnit)"
-	@echo "make scenarios   the 6 acceptance scenarios from the task"
+	@echo "make scenarios   the 10 acceptance scenarios (stage 1: 1-6, stage 2: 7-10)"
 	@echo "make race        acceptance #1 only: 50 parallel webhooks"
 	@echo "make chaos       40 orders against suppliers failing 40% / hanging 25%"
 	@echo "make explain     execution plans for the storefront query (stage 5)"

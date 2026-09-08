@@ -14,20 +14,25 @@ final class DeliveryPrimitivesTest extends TestCase
 {
     public function testRequestIdIsDerivedAndStable(): void
     {
-        self::assertSame('req_ord_00123_A_1', DeliveryService::requestId('ord_00123', 'A', 1));
+        self::assertSame('req_ord_00123_oi_000001_A_1', DeliveryService::requestId('ord_00123', 'oi_000001', 'A', 1));
         self::assertSame(
-            DeliveryService::requestId('ord_00123', 'A', 1),
-            DeliveryService::requestId('ord_00123', 'A', 1),
-            'the same order/supplier/epoch must always produce the same idempotency key'
+            DeliveryService::requestId('ord_00123', 'oi_000001', 'A', 1),
+            DeliveryService::requestId('ord_00123', 'oi_000001', 'A', 1),
+            'the same order/item/supplier/epoch must always produce the same idempotency key'
         );
         self::assertNotSame(
-            DeliveryService::requestId('ord_00123', 'A', 1),
-            DeliveryService::requestId('ord_00123', 'A', 2),
+            DeliveryService::requestId('ord_00123', 'oi_000001', 'A', 1),
+            DeliveryService::requestId('ord_00123', 'oi_000001', 'A', 2),
             'a new attempt after a definitive failure needs a fresh key'
         );
         self::assertNotSame(
-            DeliveryService::requestId('ord_00123', 'A', 1),
-            DeliveryService::requestId('ord_00123', 'B', 1)
+            DeliveryService::requestId('ord_00123', 'oi_000001', 'A', 1),
+            DeliveryService::requestId('ord_00123', 'oi_000001', 'B', 1)
+        );
+        self::assertNotSame(
+            DeliveryService::requestId('ord_00123', 'oi_000001', 'A', 1),
+            DeliveryService::requestId('ord_00123', 'oi_000002', 'A', 1),
+            'two items in the same basket must never share an idempotency key'
         );
     }
 

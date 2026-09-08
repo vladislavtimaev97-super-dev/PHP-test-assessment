@@ -11,6 +11,10 @@ x-app-env: &app-env
   SUPPLIER_BACKOFF_BASE_MS: "200"
   SUPPLIER_BACKOFF_JITTER_MS: "150"
   STUCK_ORDER_SECONDS: "10"
+  # Stage 2, task 1: how long an item may sit out_of_stock/delivery_failed
+  # before the sweeper gives up and refunds it, so a basket always reaches a
+  # final state. Short in this dev/demo stack so scenarios finish quickly.
+  ITEM_GIVE_UP_AFTER_SECONDS: "20"
   WORKER_SWEEP_SECONDS: "5"
   WORKER_STOCK_SYNC_SECONDS: "15"
   SEED_EXTRA_SKUS: "5000"

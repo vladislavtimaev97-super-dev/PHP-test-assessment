@@ -60,6 +60,14 @@ final class SupplierStub
             return Response::json(['status' => 'pending', 'request_id' => $requestId], 409);
         }
 
+        // ---- stage 2, #3: the supplier's own rate limit. Only genuinely NEW
+        // demand counts — an idempotent replay above never reaches here.
+        if ($cfg['rate_limit_per_min'] > 0 && !$this->consumeRateLimitSlot($cfg['rate_limit_per_min'])) {
+            $this->log('stub_rate_limited', $requestId, ['order_id' => $orderId]);
+
+            return Response::json(['status' => 'error', 'reason' => 'rate_limited'], 429);
+        }
+
         if ($cfg['down']) {
             $this->log('stub_down', $requestId, ['order_id' => $orderId]);
 
@@ -115,9 +123,23 @@ final class SupplierStub
                 : $this->replay($again, $cfg);
         }
 
-        $result = $this->reserveKey($requestId, $sku, $orderId, $cfg['out_of_stock']);
+        $result = $this->reserveKey($requestId, $sku, $orderId, $cfg['out_of_stock'], $cfg['duplicate_code_rate']);
 
         if ($result['outcome'] === 'ok') {
+            // ---- stage 2, #2: lie about the error AFTER really issuing ----
+            // The code is genuinely committed in stub.requests/stub.keys; we
+            // just answer as if we had not issued it. An idempotent retry or
+            // a probe on this same request_id reveals the truth — the same
+            // mechanism the caller already needs for a real timeout.
+            if ($this->roll($cfg['lie_about_error_rate'])) {
+                $this->log('stub_lie_about_error', $requestId, [
+                    'order_id' => $orderId, 'code' => $result['code'],
+                    'note'     => 'code committed, answering with an error anyway',
+                ]);
+
+                return Response::json(['status' => 'error', 'reason' => 'injected_lie'], 500);
+            }
+
             $this->log('stub_issued', $requestId, ['order_id' => $orderId, 'code' => $result['code']]);
 
             return Response::json([
@@ -192,6 +214,7 @@ final class SupplierStub
         $allowed = [
             'down', 'out_of_stock', 'fail_rate', 'timeout_rate',
             'latency_ms', 'hang_ms', 'hang_only_first', 'issue_before_hang',
+            'duplicate_code_rate', 'lie_about_error_rate', 'rate_limit_per_min',
         ];
 
         $sets   = [];
@@ -242,7 +265,9 @@ final class SupplierStub
             $pdo->prepare(
                 "UPDATE stub.config SET down = false, out_of_stock = false, fail_rate = 0,
                         timeout_rate = 0, latency_ms = 0, hang_ms = 5000,
-                        hang_only_first = true, issue_before_hang = true, updated_at = now()
+                        hang_only_first = true, issue_before_hang = true,
+                        duplicate_code_rate = 0, lie_about_error_rate = 0, rate_limit_per_min = 0,
+                        updated_at = now()
                  WHERE supplier = :s"
             )->execute(['s' => $this->supplier]);
         });
@@ -301,8 +326,40 @@ final class SupplierStub
      *
      * @return array{outcome:string,code:?string,reason:?string}
      */
-    private function reserveKey(string $requestId, string $sku, string $orderId, bool $forceEmpty): array
-    {
+    private function reserveKey(
+        string $requestId,
+        string $sku,
+        string $orderId,
+        bool $forceEmpty,
+        float $duplicateCodeRate = 0.0,
+    ): array {
+        // ---- stage 2, #2: a supplier that cannot be trusted -----------------
+        // Instead of reserving a fresh key, hand back one that is already
+        // bound to a DIFFERENT request_id. This is a real bug on the
+        // supplier's side, deliberately injected: from the core's point of
+        // view it looks exactly like "same code twice" or "someone else's
+        // code" — both are just a code that is not exclusively ours, and
+        // both are caught the same way, by deliveries.code UNIQUE.
+        if (!$forceEmpty && $this->roll($duplicateCodeRate)) {
+            $stolen = Db::value(
+                "SELECT code FROM stub.keys WHERE supplier = :s AND status = 'issued'
+                 ORDER BY random() LIMIT 1",
+                ['s' => $this->supplier]
+            );
+            if ($stolen !== null) {
+                Db::run(
+                    "UPDATE stub.requests SET outcome = 'ok', code = :c, reason = NULL
+                     WHERE supplier = :s AND request_id = :r",
+                    ['c' => $stolen, 's' => $this->supplier, 'r' => $requestId]
+                );
+                $this->log('stub_duplicate_code_injected', $requestId, ['code' => $stolen]);
+
+                return ['outcome' => 'ok', 'code' => (string) $stolen, 'reason' => null];
+            }
+            // No issued key exists yet (e.g. the very first request ever):
+            // fall through to a normal, honest reservation.
+        }
+
         // `FOR UPDATE SKIP LOCKED ... LIMIT 1` can come back empty even when the
         // pool is not: the single candidate row may have been taken and
         // committed by a concurrent request, and Postgres then filters it out
@@ -393,16 +450,39 @@ final class SupplierStub
         $row = Db::one('SELECT * FROM stub.config WHERE supplier = :s', ['s' => $this->supplier]);
 
         return [
-            'supplier'          => $this->supplier,
-            'down'              => (bool) $row['down'],
-            'out_of_stock'      => (bool) $row['out_of_stock'],
-            'fail_rate'         => (float) $row['fail_rate'],
-            'timeout_rate'      => (float) $row['timeout_rate'],
-            'latency_ms'        => (int) $row['latency_ms'],
-            'hang_ms'           => (int) $row['hang_ms'],
-            'hang_only_first'   => (bool) $row['hang_only_first'],
-            'issue_before_hang' => (bool) $row['issue_before_hang'],
+            'supplier'             => $this->supplier,
+            'down'                 => (bool) $row['down'],
+            'out_of_stock'         => (bool) $row['out_of_stock'],
+            'fail_rate'            => (float) $row['fail_rate'],
+            'timeout_rate'         => (float) $row['timeout_rate'],
+            'latency_ms'           => (int) $row['latency_ms'],
+            'hang_ms'              => (int) $row['hang_ms'],
+            'hang_only_first'      => (bool) $row['hang_only_first'],
+            'issue_before_hang'    => (bool) $row['issue_before_hang'],
+            'duplicate_code_rate'  => (float) $row['duplicate_code_rate'],
+            'lie_about_error_rate' => (float) $row['lie_about_error_rate'],
+            'rate_limit_per_min'   => (int) $row['rate_limit_per_min'],
         ];
+    }
+
+    /**
+     * Sliding 60s window over stub.call_log. True = a slot was consumed and
+     * the caller may proceed; false = the agreed rate would be exceeded.
+     * Only genuinely new demand reaches this (idempotent replays never do),
+     * so this is exactly "requests per minute", not "HTTP calls per minute".
+     */
+    private function consumeRateLimitSlot(int $perMinute): bool
+    {
+        return (bool) Db::value(
+            "WITH recent AS (
+                 SELECT count(*) AS n FROM stub.call_log
+                 WHERE supplier = :s AND called_at > now() - interval '60 seconds'
+             )
+             INSERT INTO stub.call_log (supplier)
+             SELECT :s FROM recent WHERE recent.n < :limit
+             RETURNING true",
+            ['s' => $this->supplier, 'limit' => $perMinute]
+        );
     }
 
     private function roll(float $probability): bool

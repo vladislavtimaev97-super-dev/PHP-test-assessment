@@ -29,10 +29,22 @@ final class OrderLifecycleTest extends IntegrationTestCase
         self::assertSame(0, $this->ledgerSum($orderId));
 
         $history = array_column(
-            Db::all('SELECT to_status FROM order_status_history WHERE order_id = :o ORDER BY id', ['o' => $orderId]),
+            Db::all(
+                "SELECT to_status FROM order_status_history WHERE order_id = :o AND item_id = '' ORDER BY id",
+                ['o' => $orderId]
+            ),
             'to_status'
         );
         self::assertSame(['created', 'paid', 'delivering', 'delivered'], $history);
+
+        $itemHistory = array_column(
+            Db::all(
+                "SELECT to_status FROM order_status_history WHERE order_id = :o AND item_id <> '' ORDER BY id",
+                ['o' => $orderId]
+            ),
+            'to_status'
+        );
+        self::assertSame(['pending', 'delivering', 'delivered'], $itemHistory);
     }
 
     public function testUnknownSkuIsRejected(): void

@@ -62,12 +62,18 @@ while ($running) {
 
                 $terminal = in_array($result['result'], [
                     DeliveryService::DELIVERED,
+                    DeliveryService::PARTIALLY_DELIVERED,
+                    DeliveryService::REFUNDED,
                     DeliveryService::ALREADY,
                     DeliveryService::NOT_PAYABLE,
                 ], true);
 
                 if ($terminal) {
                     JobQueue::complete((int) $job['id']);
+                } elseif ($result['result'] === DeliveryService::RATE_LIMITED) {
+                    // The supplier's own limit, not a failure: reschedule
+                    // quickly and do not count it against max_attempts.
+                    JobQueue::retrySoon((int) $job['id'], 'rate_limited', 1.0 + (random_int(0, 500) / 1000));
                 } else {
                     // RETRY_LATER / OUT_OF_STOCK / FAILED / LOCKED are all
                     // recoverable: back off and try again later.

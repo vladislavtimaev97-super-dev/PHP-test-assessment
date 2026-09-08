@@ -24,6 +24,18 @@ final class JobQueue
     public const DELIVER_ORDER = 'deliver_order';
 
     /**
+     * Stage 2, #3: lower number = served first. Only paid orders ever reach
+     * this queue (a delivery job is enqueued after `payment_captured`), so
+     * priority is applied at a finer grain than "paid vs unpaid": a fresh,
+     * customer-facing trigger (a payment that just landed, an explicit
+     * manual /deliver call) outranks a background retry the sweeper queued
+     * for an order that was already stuck. Within the same tier, FIFO
+     * (`run_after, id`) applies.
+     */
+    public const PRIORITY_CUSTOMER   = 10;
+    public const PRIORITY_BACKGROUND = 100;
+
+    /**
      * Enqueue at most one live job per (type, order). Enforced by a partial
      * unique index, so 50 concurrent webhooks produce exactly one job.
      */
@@ -33,10 +45,11 @@ final class JobQueue
         string $orderId,
         float $delaySeconds = 0.0,
         ?string $traceId = null,
+        int $priority = self::PRIORITY_CUSTOMER,
     ): bool {
         $st = $pdo->prepare(
-            "INSERT INTO jobs (type, order_id, run_after, trace_id)
-             VALUES (:type, :order_id, now() + make_interval(secs => CAST(:delay AS double precision)), :trace)
+            "INSERT INTO jobs (type, order_id, run_after, trace_id, priority)
+             VALUES (:type, :order_id, now() + make_interval(secs => CAST(:delay AS double precision)), :trace, :priority)
              ON CONFLICT (type, order_id) WHERE status IN ('queued','running') DO NOTHING
              RETURNING id"
         );
@@ -45,6 +58,7 @@ final class JobQueue
             'order_id' => $orderId,
             'delay'    => $delaySeconds,
             'trace'    => $traceId ?? Log::traceId(),
+            'priority' => $priority,
         ]);
 
         return $st->fetchColumn() !== false;
@@ -62,7 +76,7 @@ final class JobQueue
              WHERE id = (
                  SELECT id FROM jobs
                  WHERE status = 'queued' AND run_after <= now()
-                 ORDER BY run_after, id
+                 ORDER BY priority, run_after, id
                  FOR UPDATE SKIP LOCKED
                  LIMIT 1
              )
@@ -102,6 +116,23 @@ final class JobQueue
                              run_after = now() + make_interval(secs => CAST(:d AS double precision)), updated_at = now()
              WHERE id = :id",
             ['id' => $jobId, 'e' => $reason, 'd' => $delay]
+        );
+    }
+
+    /**
+     * Stage 2, #3: reschedule quickly WITHOUT burning a retry attempt.
+     * Being rate-limited by a supplier is not a failure of the job — it is
+     * the queue working as designed — so it must not count toward
+     * max_attempts the way a real delivery failure does.
+     */
+    public static function retrySoon(int $jobId, string $reason, float $delaySeconds): void
+    {
+        Db::run(
+            "UPDATE jobs SET status = 'queued', locked_by = NULL, last_error = :e,
+                             attempts = GREATEST(0, attempts - 1),
+                             run_after = now() + make_interval(secs => CAST(:d AS double precision)), updated_at = now()
+             WHERE id = :id",
+            ['id' => $jobId, 'e' => $reason, 'd' => $delaySeconds]
         );
     }
 
